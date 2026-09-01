@@ -1,0 +1,661 @@
+// An HTTP/1.1 client built directly on std/network + std/tls (raw sockets),
+// not on std/http (which only offers a GET-only, sentinel-error-coded
+// helper). Supports all methods, custom headers, raw/form/JSON/multipart
+// bodies, and redirect-following, all through !Error.
+//
+// Not supported yet: connection reuse/keep-alive (every request opens and
+// closes its own socket), cookies/sessions, HTTP/2, compression, timeouts.
+
+import "std/string" as string;
+import "std/collection" as collection;
+import "std/convert" as convert;
+import "std/network" as network;
+import "std/tls" as tls;
+import "std/json" as json;
+import "std/random" as random;
+
+pub enum ErrorKind {
+    InvalidUrl,
+    UnsupportedScheme,
+    ConnectionFailed,
+    SendFailed,
+    RecvFailed,
+    InvalidResponse,
+    TooManyRedirects,
+    EncodingFailed,
+    MissingHeader,
+}
+
+@error
+pub struct Error { kind: ErrorKind, message: String }
+
+fun mkErr(kind: ErrorKind, message: String) Error {
+    return Error { kind: kind, message: message };
+}
+
+pub enum Method { GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS }
+
+pub fun methodName(m: Method) String {
+    if m == Method.GET { return "GET"; }
+    if m == Method.POST { return "POST"; }
+    if m == Method.PUT { return "PUT"; }
+    if m == Method.DELETE { return "DELETE"; }
+    if m == Method.PATCH { return "PATCH"; }
+    if m == Method.HEAD { return "HEAD"; }
+    return "OPTIONS";
+}
+
+fun isDigitChar(c: Char) Bool { return c >= '0' && c <= '9'; }
+
+fun toLowerChar(c: Char) Char {
+    if c >= 'A' && c <= 'Z' { return convert.toChar(convert.toInt(c) + 32); }
+    return c;
+}
+
+fun eqIgnoreCase(a: String, b: String) Bool {
+    var n: Int = string.len(a);
+    if n != string.len(b) { return false; }
+    var i: Int = 0;
+    while i < n {
+        if toLowerChar(string.at(a, i)) != toLowerChar(string.at(b, i)) { return false; }
+        i = i + 1;
+    }
+    return true;
+}
+
+fun isUnreservedChar(c: Char) Bool {
+    return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9')
+        || c == '-' || c == '_' || c == '.' || c == '~';
+}
+
+fun hexDigitUpper(value: Int) Char {
+    if value < 10 { return convert.toChar(convert.toInt('0') + value); }
+    return convert.toChar(convert.toInt('A') + value - 10);
+}
+
+fun hexValue(c: Char) Int {
+    if c >= '0' && c <= '9' { return convert.toInt(c) - convert.toInt('0'); }
+    if c >= 'a' && c <= 'f' { return convert.toInt(c) - convert.toInt('a') + 10; }
+    if c >= 'A' && c <= 'F' { return convert.toInt(c) - convert.toInt('A') + 10; }
+    return -1;
+}
+
+// Percent-encodes everything except RFC 3986 "unreserved" characters --
+// safe for both a query string component and a form-urlencoded value.
+pub fun urlEncode(text: String) String {
+    let out = new string.TextBuf();
+    var i: Int = 0;
+    var n: Int = string.len(text);
+    while i < n {
+        var c: Char = string.at(text, i);
+        if isUnreservedChar(c) {
+            out.pushChar(c);
+        } else {
+            var code: Int = convert.toInt(c);
+            if code < 0 { code = code + 256; }
+            out.pushChar('%');
+            out.pushChar(hexDigitUpper(code / 16));
+            out.pushChar(hexDigitUpper(code % 16));
+        }
+        i = i + 1;
+    }
+    return out.build();
+}
+
+pub fun urlDecode(text: String) String {
+    let out = new string.TextBuf();
+    var i: Int = 0;
+    var n: Int = string.len(text);
+    while i < n {
+        var c: Char = string.at(text, i);
+        if c == '%' && i + 2 < n {
+            var hi: Int = hexValue(string.at(text, i + 1));
+            var lo: Int = hexValue(string.at(text, i + 2));
+            if hi >= 0 && lo >= 0 {
+                out.pushChar(convert.toChar(hi * 16 + lo));
+                i = i + 3;
+            } else {
+                out.pushChar(c);
+                i = i + 1;
+            }
+        } else if c == '+' {
+            out.pushChar(' ');
+            i = i + 1;
+        } else {
+            out.pushChar(c);
+            i = i + 1;
+        }
+    }
+    return out.build();
+}
+
+pub struct Url { scheme: String, host: String, port: Int, path: String, query: String }
+
+pub fun parseUrl(raw: String) Url!Error {
+    var schemeSep: Int = string.indexOf(string.view(raw), "://");
+    if schemeSep < 0 {
+        fail mkErr(ErrorKind.InvalidUrl, "missing scheme (expected http:// or https://)");
+    }
+    var scheme: String = string.owned(string.slice(string.view(raw), 0, schemeSep));
+    if !string.eq(scheme, "http") && !string.eq(scheme, "https") {
+        fail mkErr(ErrorKind.UnsupportedScheme, "unsupported scheme: " + scheme);
+    }
+
+    var afterScheme: Int = schemeSep + 3;
+    var rest: String = string.owned(string.slice(string.view(raw), afterScheme, string.len(raw) - afterScheme));
+
+    var pathStart: Int = string.indexOf(string.view(rest), "/");
+    var authority: String;
+    var pathAndQuery: String;
+    if pathStart < 0 {
+        authority = rest;
+        pathAndQuery = "/";
+    } else {
+        authority = string.owned(string.slice(string.view(rest), 0, pathStart));
+        pathAndQuery = string.owned(string.slice(string.view(rest), pathStart, string.len(rest) - pathStart));
+    }
+
+    var host: String;
+    var port: Int;
+    var portColon: Int = string.indexOf(string.view(authority), ":");
+    if portColon < 0 {
+        host = authority;
+        port = string.eq(scheme, "https") ? 443 : 80;
+    } else {
+        host = string.owned(string.slice(string.view(authority), 0, portColon));
+        var portText: String = string.owned(string.slice(string.view(authority), portColon + 1, string.len(authority) - portColon - 1));
+        if string.len(portText) == 0 {
+            fail mkErr(ErrorKind.InvalidUrl, "empty port after ':'");
+        }
+        var parsedPort: Int = 0;
+        var i: Int = 0;
+        while i < string.len(portText) {
+            var c: Char = string.at(portText, i);
+            if !isDigitChar(c) { fail mkErr(ErrorKind.InvalidUrl, "invalid port: " + portText); }
+            parsedPort = parsedPort * 10 + convert.toInt(c) - convert.toInt('0');
+            i = i + 1;
+        }
+        if parsedPort <= 0 || parsedPort > 65535 {
+            fail mkErr(ErrorKind.InvalidUrl, "port out of range: " + portText);
+        }
+        port = parsedPort;
+    }
+
+    if string.len(host) == 0 {
+        fail mkErr(ErrorKind.InvalidUrl, "empty host");
+    }
+
+    var path: String;
+    var query: String;
+    var queryStart: Int = string.indexOf(string.view(pathAndQuery), "?");
+    if queryStart < 0 {
+        path = pathAndQuery;
+        query = "";
+    } else {
+        path = string.owned(string.slice(string.view(pathAndQuery), 0, queryStart));
+        query = string.owned(string.slice(string.view(pathAndQuery), queryStart + 1, string.len(pathAndQuery) - queryStart - 1));
+    }
+
+    return Url { scheme: scheme, host: host, port: port, path: path, query: query };
+}
+
+// Resolves a `Location` header against the URL it was returned for -- per
+// RFC 7231 that header may be a relative reference, not just an absolute
+// URL (e.g. httpbin.org's own /redirect/N returns a bare absolute path).
+fun resolveLocation(base: Url, location: String) String {
+    if string.indexOf(string.view(location), "://") >= 0 {
+        return location;
+    }
+
+    var hostPart: String = base.host;
+    if (string.eq(base.scheme, "http") && base.port != 80) || (string.eq(base.scheme, "https") && base.port != 443) {
+        hostPart = hostPart + ":" + convert.toString(base.port);
+    }
+    var origin: String = base.scheme + "://" + hostPart;
+
+    if string.len(location) > 0 && string.at(location, 0) == '/' {
+        return origin + location;
+    }
+
+    var lastSlash: Int = -1;
+    var i: Int = 0;
+    while i < string.len(base.path) {
+        if string.at(base.path, i) == '/' { lastSlash = i; }
+        i = i + 1;
+    }
+    var dir: String = "/";
+    if lastSlash >= 0 { dir = string.owned(string.slice(string.view(base.path), 0, lastSlash + 1)); }
+    return origin + dir + location;
+}
+
+// Ordered, case-insensitive, multi-value-capable header collection (needed
+// for things like repeated Set-Cookie response headers, which a plain
+// String->String map can't represent).
+pub class Headers {
+    priv names: collection.List<String>;
+    priv values: collection.List<String>;
+
+    fun init() {
+        self.names = new collection.List<String>();
+        self.values = new collection.List<String>();
+    }
+
+    fun indexOfName(name: String) Int {
+        var i: Int = 0;
+        while i < self.names.len() {
+            if eqIgnoreCase(self.names.at(i), name) { return i; }
+            i = i + 1;
+        }
+        return -1;
+    }
+
+    // Removes every existing entry with this name, then adds one.
+    pub fun set(name: String, value: String) {
+        var i: Int = 0;
+        while i < self.names.len() {
+            if eqIgnoreCase(self.names.at(i), name) {
+                self.names.removeAt(i);
+                self.values.removeAt(i);
+            } else {
+                i = i + 1;
+            }
+        }
+        self.names.push(name);
+        self.values.push(value);
+    }
+
+    // Adds without removing existing entries -- for headers that may
+    // legitimately repeat.
+    pub fun add(name: String, value: String) {
+        self.names.push(name);
+        self.values.push(value);
+    }
+
+    pub fun has(name: String) Bool { return self.indexOfName(name) >= 0; }
+    pub fun len() Int { return self.names.len(); }
+    pub fun nameAt(index: Int) String { return self.names.at(index); }
+    pub fun valueAt(index: Int) String { return self.values.at(index); }
+
+    pub fun get(name: String) String!Error {
+        var idx: Int = self.indexOfName(name);
+        if idx < 0 { fail mkErr(ErrorKind.MissingHeader, "missing header: " + name); }
+        return self.values.at(idx);
+    }
+
+    pub fun getOr(name: String, fallback: String) String {
+        var idx: Int = self.indexOfName(name);
+        if idx < 0 { return fallback; }
+        return self.values.at(idx);
+    }
+}
+
+fun uint32Hex(value: UInt) String {
+    let digits = "0123456789abcdef";
+    let out = new string.TextBuf();
+    var shift: Int = 28;
+    while shift >= 0 {
+        var nibble: Int = (value >> shift) & 15;
+        out.pushChar(string.at(digits, nibble));
+        shift = shift - 4;
+    }
+    return out.build();
+}
+
+pub class MultipartBuilder {
+    priv boundary: String;
+    priv buf: string.TextBuf;
+
+    fun init() {
+        let rng = new random.Rng();
+        self.boundary = "----ZapFormBoundary" + uint32Hex(rng.nextUInt32()) + uint32Hex(rng.nextUInt32());
+        self.buf = new string.TextBuf();
+    }
+
+    pub fun boundaryValue() String { return self.boundary; }
+
+    pub fun addField(name: String, value: String) MultipartBuilder {
+        self.buf.push("--" + self.boundary + "\r\n");
+        self.buf.push("Content-Disposition: form-data; name=\"" + name + "\"\r\n\r\n");
+        self.buf.push(value);
+        self.buf.push("\r\n");
+        return self;
+    }
+
+    pub fun addFile(fieldName: String, filename: String, contentType: String, data: String) MultipartBuilder {
+        self.buf.push("--" + self.boundary + "\r\n");
+        self.buf.push("Content-Disposition: form-data; name=\"" + fieldName + "\"; filename=\"" + filename + "\"\r\n");
+        self.buf.push("Content-Type: " + contentType + "\r\n\r\n");
+        self.buf.push(data);
+        self.buf.push("\r\n");
+        return self;
+    }
+
+    pub fun build() String {
+        self.buf.push("--" + self.boundary + "--\r\n");
+        return self.buf.build();
+    }
+}
+
+pub class Response {
+    priv statusCodeValue: Int;
+    priv statusTextValue: String;
+    priv headersValue: Headers;
+    priv bodyValue: String;
+
+    fun init(statusCode: Int, statusText: String, headers: Headers, body: String) {
+        self.statusCodeValue = statusCode;
+        self.statusTextValue = statusText;
+        self.headersValue = headers;
+        self.bodyValue = body;
+    }
+
+    pub fun status() Int { return self.statusCodeValue; }
+    pub fun statusText() String { return self.statusTextValue; }
+    pub fun headers() Headers { return self.headersValue; }
+    pub fun text() String { return self.bodyValue; }
+    pub fun ok() Bool { return self.statusCodeValue >= 200 && self.statusCodeValue < 300; }
+    pub fun isRedirect() Bool { return self.statusCodeValue >= 300 && self.statusCodeValue < 400; }
+
+    pub fun json() json.Value!Error {
+        var failed: Bool = false;
+        var failMessage: String = "";
+        var result: json.Value = json.parse(self.bodyValue) or err {
+            failed = true;
+            failMessage = err.message;
+            json.Value.nullValue()
+        };
+        if failed {
+            fail mkErr(ErrorKind.InvalidResponse, "response body is not valid JSON: " + failMessage);
+        }
+        return result;
+    }
+}
+
+struct StatusLine { code: Int, reason: String }
+
+fun parseStatusLine(line: String) StatusLine!Error {
+    var firstSpace: Int = string.indexOf(string.view(line), " ");
+    if firstSpace < 0 { fail mkErr(ErrorKind.InvalidResponse, "malformed status line: " + line); }
+    var rest: String = string.owned(string.slice(string.view(line), firstSpace + 1, string.len(line) - firstSpace - 1));
+    var secondSpace: Int = string.indexOf(string.view(rest), " ");
+    var codeText: String;
+    var reason: String;
+    if secondSpace < 0 { codeText = rest; reason = ""; }
+    else {
+        codeText = string.owned(string.slice(string.view(rest), 0, secondSpace));
+        reason = string.owned(string.slice(string.view(rest), secondSpace + 1, string.len(rest) - secondSpace - 1));
+    }
+    if string.len(codeText) != 3 { fail mkErr(ErrorKind.InvalidResponse, "malformed status code: " + codeText); }
+    var code: Int = 0;
+    var i: Int = 0;
+    while i < string.len(codeText) {
+        var c: Char = string.at(codeText, i);
+        if !isDigitChar(c) { fail mkErr(ErrorKind.InvalidResponse, "malformed status code: " + codeText); }
+        code = code * 10 + convert.toInt(c) - convert.toInt('0');
+        i = i + 1;
+    }
+    return StatusLine { code: code, reason: reason };
+}
+
+fun decodeChunked(encoded: String) String!Error {
+    var out: string.TextBuf = new string.TextBuf();
+    var cursor: Int = 0;
+    var n: Int = string.len(encoded);
+    while cursor < n {
+        var lineLen: Int = string.indexOf(string.slice(string.view(encoded), cursor, n - cursor), "\r\n");
+        if lineLen < 0 { fail mkErr(ErrorKind.InvalidResponse, "truncated chunked encoding"); }
+        var size: Int = 0;
+        var i: Int = 0;
+        while i < lineLen && string.at(encoded, cursor + i) != ';' {
+            var digit: Int = hexValue(string.at(encoded, cursor + i));
+            if digit < 0 { fail mkErr(ErrorKind.InvalidResponse, "invalid chunk size"); }
+            size = size * 16 + digit;
+            i = i + 1;
+        }
+        cursor = cursor + lineLen + 2;
+        if size == 0 { return out.build(); }
+        if cursor + size + 2 > n { fail mkErr(ErrorKind.InvalidResponse, "truncated chunk body"); }
+        out.push(string.slice(string.view(encoded), cursor, size));
+        cursor = cursor + size;
+        if string.at(encoded, cursor) != '\r' || string.at(encoded, cursor + 1) != '\n' {
+            fail mkErr(ErrorKind.InvalidResponse, "malformed chunk terminator");
+        }
+        cursor = cursor + 2;
+    }
+    fail mkErr(ErrorKind.InvalidResponse, "chunked encoding never terminated");
+    return ""; // unreachable
+}
+
+fun parseRawResponse(raw: String) Response!Error {
+    var separator: Int = string.indexOf(string.view(raw), "\r\n\r\n");
+    if separator < 0 { fail mkErr(ErrorKind.InvalidResponse, "no header/body separator in response"); }
+
+    var headerBlock: String = string.owned(string.slice(string.view(raw), 0, separator));
+    var body: String = string.owned(string.slice(string.view(raw), separator + 4, string.len(raw) - separator - 4));
+
+    var lineEnd: Int = string.indexOf(string.view(headerBlock), "\r\n");
+    var statusLineText: String;
+    var rest: String;
+    if lineEnd < 0 { statusLineText = headerBlock; rest = ""; }
+    else {
+        statusLineText = string.owned(string.slice(string.view(headerBlock), 0, lineEnd));
+        rest = string.owned(string.slice(string.view(headerBlock), lineEnd + 2, string.len(headerBlock) - lineEnd - 2));
+    }
+
+    var parsedStatus: StatusLine = parseStatusLine(statusLineText)?;
+    var headers: Headers = new Headers();
+    var cursor: Int = 0;
+    var restLen: Int = string.len(rest);
+    while cursor < restLen {
+        var nextLineEnd: Int = string.indexOf(string.slice(string.view(rest), cursor, restLen - cursor), "\r\n");
+        if nextLineEnd < 0 { nextLineEnd = restLen - cursor; }
+        var line: String = string.owned(string.slice(string.view(rest), cursor, nextLineEnd));
+        var colon: Int = string.indexOf(string.view(line), ":");
+        if colon > 0 {
+            var name: String = string.owned(string.slice(string.view(line), 0, colon));
+            var value: String = string.trim(string.slice(string.view(line), colon + 1, string.len(line) - colon - 1));
+            headers.add(name, value);
+        }
+        cursor = cursor + nextLineEnd + 2;
+    }
+
+    if eqIgnoreCase(headers.getOr("Transfer-Encoding", ""), "chunked") {
+        body = decodeChunked(body)?;
+    }
+
+    return new Response(parsedStatus.code, parsedStatus.reason, headers, body);
+}
+
+// The actual socket exchange, generic over the stream type so the same
+// logic covers both plaintext (network.Stream) and TLS (tls.Stream)
+// connections instead of duplicating it per scheme.
+fun exchange<S>(stream: S, requestText: String) String!Error {
+    if !stream.isOpen() { fail mkErr(ErrorKind.ConnectionFailed, "connection is not open"); }
+    if stream.sendAll(requestText) != string.len(requestText) {
+        fail mkErr(ErrorKind.SendFailed, "failed to send full request");
+    }
+    var out: string.TextBuf = new string.TextBuf();
+    while stream.isOpen() {
+        var chunk: String = stream.recv(8192);
+        if string.len(chunk) == 0 { break; }
+        out.push(string.view(chunk));
+    }
+    return out.build();
+}
+
+pub class Request {
+    priv methodValue: Method;
+    priv urlValue: String;
+    priv headersValue: Headers;
+    priv extraQuery: collection.List<String>;
+    priv hasBody: Bool;
+    priv bodyBytes: String;
+    priv maxRedirects: Int;
+    priv followRedirects: Bool;
+
+    fun init(method: Method, url: String) {
+        self.methodValue = method;
+        self.urlValue = url;
+        self.headersValue = new Headers();
+        self.extraQuery = new collection.List<String>();
+        self.hasBody = false;
+        self.bodyBytes = "";
+        self.maxRedirects = 10;
+        self.followRedirects = true;
+    }
+
+    pub static fun get(url: String) Request { return new Request(Method.GET, url); }
+    pub static fun post(url: String) Request { return new Request(Method.POST, url); }
+    pub static fun put(url: String) Request { return new Request(Method.PUT, url); }
+    pub static fun delete(url: String) Request { return new Request(Method.DELETE, url); }
+    pub static fun patch(url: String) Request { return new Request(Method.PATCH, url); }
+    pub static fun head(url: String) Request { return new Request(Method.HEAD, url); }
+    pub static fun options(url: String) Request { return new Request(Method.OPTIONS, url); }
+
+    pub fun header(name: String, value: String) Request { self.headersValue.set(name, value); return self; }
+    pub fun addHeader(name: String, value: String) Request { self.headersValue.add(name, value); return self; }
+    pub fun query(name: String, value: String) Request { self.extraQuery.push(urlEncode(name) + "=" + urlEncode(value)); return self; }
+
+    pub fun body(text: String, contentType: String) Request {
+        self.hasBody = true;
+        self.bodyBytes = text;
+        self.headersValue.set("Content-Type", contentType);
+        return self;
+    }
+
+    pub fun jsonBody(value: json.Value) Request!Error {
+        var failed: Bool = false;
+        var failMessage: String = "";
+        var text: String = value.stringify() or err {
+            failed = true;
+            failMessage = err.message;
+            ""
+        };
+        if failed {
+            fail mkErr(ErrorKind.EncodingFailed, "failed to encode JSON body: " + failMessage);
+        }
+        return self.body(text, "application/json");
+    }
+
+    pub fun formField(name: String, value: String) Request {
+        if string.len(self.bodyBytes) > 0 { self.bodyBytes = self.bodyBytes + "&"; }
+        self.bodyBytes = self.bodyBytes + urlEncode(name) + "=" + urlEncode(value);
+        self.hasBody = true;
+        self.headersValue.set("Content-Type", "application/x-www-form-urlencoded");
+        return self;
+    }
+
+    pub fun multipartBody(form: MultipartBuilder) Request {
+        self.hasBody = true;
+        self.bodyBytes = form.build();
+        self.headersValue.set("Content-Type", "multipart/form-data; boundary=" + form.boundaryValue());
+        return self;
+    }
+
+    pub fun redirects(max: Int) Request { self.maxRedirects = max; return self; }
+    pub fun noRedirects() Request { self.followRedirects = false; self.maxRedirects = 0; return self; }
+
+    fun wireText(parsed: Url) String {
+        var path: String = parsed.path;
+        if string.len(path) == 0 { path = "/"; }
+
+        var fullQuery: String = parsed.query;
+        var i: Int = 0;
+        while i < self.extraQuery.len() {
+            if string.len(fullQuery) > 0 { fullQuery = fullQuery + "&"; }
+            fullQuery = fullQuery + self.extraQuery.at(i);
+            i = i + 1;
+        }
+
+        var target: String = path;
+        if string.len(fullQuery) > 0 { target = target + "?" + fullQuery; }
+
+        var hostHeader: String = parsed.host;
+        if (string.eq(parsed.scheme, "http") && parsed.port != 80) || (string.eq(parsed.scheme, "https") && parsed.port != 443) {
+            hostHeader = hostHeader + ":" + convert.toString(parsed.port);
+        }
+
+        if !self.headersValue.has("Host") { self.headersValue.set("Host", hostHeader); }
+        if !self.headersValue.has("User-Agent") { self.headersValue.set("User-Agent", "zap-requests/0.1"); }
+        if !self.headersValue.has("Accept") { self.headersValue.set("Accept", "*/*"); }
+        if !self.headersValue.has("Connection") { self.headersValue.set("Connection", "close"); }
+        if self.hasBody { self.headersValue.set("Content-Length", convert.toString(string.len(self.bodyBytes))); }
+
+        var out: string.TextBuf = new string.TextBuf();
+        out.push(methodName(self.methodValue) + " " + target + " HTTP/1.1\r\n");
+        var h: Int = 0;
+        while h < self.headersValue.len() {
+            out.push(self.headersValue.nameAt(h) + ": " + self.headersValue.valueAt(h) + "\r\n");
+            h = h + 1;
+        }
+        out.push("\r\n");
+        if self.hasBody { out.push(self.bodyBytes); }
+        return out.build();
+    }
+
+    fun sendOnce() Response!Error {
+        var parsed: Url = parseUrl(self.urlValue)?;
+        var requestText: String = self.wireText(parsed);
+
+        if string.eq(parsed.scheme, "http") {
+            var stream: network.Stream = network.dial(parsed.host, parsed.port);
+            if !stream.isOpen() { fail mkErr(ErrorKind.ConnectionFailed, "could not connect to " + parsed.host); }
+            var failed: Bool = false;
+            var failMessage: String = "";
+            var raw: String = exchange(stream, requestText) or err {
+                stream.close();
+                failed = true;
+                failMessage = err.message;
+                ""
+            };
+            stream.close();
+            if failed { fail mkErr(ErrorKind.SendFailed, failMessage); }
+            return parseRawResponse(raw)?;
+        }
+
+        var secureStream: tls.Stream = tls.dial(parsed.host, parsed.port);
+        if !secureStream.isOpen() { fail mkErr(ErrorKind.ConnectionFailed, "could not establish TLS connection to " + parsed.host); }
+        var secureFailed: Bool = false;
+        var secureFailMessage: String = "";
+        var rawSecure: String = exchange(secureStream, requestText) or err {
+            secureStream.close();
+            secureFailed = true;
+            secureFailMessage = err.message;
+            ""
+        };
+        secureStream.close();
+        if secureFailed { fail mkErr(ErrorKind.SendFailed, secureFailMessage); }
+        return parseRawResponse(rawSecure)?;
+    }
+
+    pub fun send() Response!Error {
+        var current: Request = self;
+        var redirectsLeft: Int = self.maxRedirects;
+
+        while true {
+            var response: Response = current.sendOnce()?;
+            if !current.followRedirects || !response.isRedirect() {
+                return response;
+            }
+            if redirectsLeft <= 0 {
+                fail mkErr(ErrorKind.TooManyRedirects, "exceeded redirect limit");
+            }
+            var location: String = response.headers().get("Location") or err {
+                return response;
+            };
+            var base: Url = parseUrl(current.urlValue) or err {
+                return response;
+            };
+            current = Request.get(resolveLocation(base, location)).redirects(redirectsLeft - 1);
+            redirectsLeft = redirectsLeft - 1;
+        }
+        return current.sendOnce()?;
+    }
+}
+
+pub fun get(url: String) Response!Error { return Request.get(url).send()?; }
+pub fun post(url: String, body: String, contentType: String) Response!Error { return Request.post(url).body(body, contentType).send()?; }
+pub fun put(url: String, body: String, contentType: String) Response!Error { return Request.put(url).body(body, contentType).send()?; }
+pub fun delete(url: String) Response!Error { return Request.delete(url).send()?; }
+pub fun patch(url: String, body: String, contentType: String) Response!Error { return Request.patch(url).body(body, contentType).send()?; }
+pub fun head(url: String) Response!Error { return Request.head(url).send()?; }

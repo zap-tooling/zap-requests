@@ -1,0 +1,75 @@
+import "std/io";
+import "std/json" as json;
+import "requests";
+
+fun main() Int {
+    io.println("--- plain HTTP ---");
+    let httpResp = requests.get("http://example.com/") or err {
+        io.println("http GET failed: " + err.message);
+        return 1;
+    };
+    io.printInt(httpResp.status());
+
+    io.println("--- JSON body (PUT) ---");
+    var payload: json.Object = new json.Object();
+    payload.put("lang", "zap");
+    payload.put("cool", true);
+    let putResp = requests.Request.put("https://httpbin.org/put")
+        .jsonBody(json.Value.object(payload)) or err {
+            io.println("jsonBody failed: " + err.message);
+            return 1;
+        };
+    let putSent = putResp.send() or err {
+        io.println("PUT failed: " + err.message);
+        return 1;
+    };
+    io.printInt(putSent.status());
+    io.println(putSent.text());
+
+    io.println("--- multipart ---");
+    let form = new requests.MultipartBuilder();
+    form.addField("username", "daniel");
+    form.addFile("avatar", "a.txt", "text/plain", "hello file contents");
+    let multiResp = requests.Request.post("https://httpbin.org/post").multipartBody(form).send() or err {
+        io.println("multipart POST failed: " + err.message);
+        return 1;
+    };
+    io.printInt(multiResp.status());
+    io.println(multiResp.text());
+
+    io.println("--- redirects ---");
+    let redirResp = requests.get("https://httpbin.org/redirect/2") or err {
+        io.println("redirect GET failed: " + err.message);
+        return 1;
+    };
+    io.printInt(redirResp.status());
+    io.println(redirResp.text());
+
+    io.println("--- DELETE ---");
+    let delResp = requests.delete("https://httpbin.org/delete") or err {
+        io.println("DELETE failed: " + err.message);
+        return 1;
+    };
+    io.printInt(delResp.status());
+
+    io.println("--- chunked response ---");
+    let chunkResp = requests.get("https://httpbin.org/stream/3") or err {
+        io.println("chunked GET failed: " + err.message);
+        return 1;
+    };
+    io.printInt(chunkResp.status());
+    io.println(chunkResp.text());
+
+    io.println("--- Response.json() ---");
+    let jsonResp = requests.get("https://httpbin.org/json") or err {
+        io.println("json GET failed: " + err.message);
+        return 1;
+    };
+    let parsed = jsonResp.json() or err {
+        io.println("json() parse failed: " + err.message);
+        return 1;
+    };
+    io.printBool(parsed.isObject());
+
+    return 0;
+}

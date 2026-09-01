@@ -1,0 +1,6 @@
+name         = "zap-requests"
+version      = "0.1.0"
+out          = "build/"
+entry        = "src/main.zp"
+
+compiler = "tools/zapc-no-pie"

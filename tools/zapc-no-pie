@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Zap v0.4.1's bundled runtime object is not PIE-compatible. Ubuntu's default
+# C compiler links PIE executables, so finish Zap's object build with -no-pie.
+set -euo pipefail
+
+zapc_bin="${ZAPC_BIN:-zapc}"
+runtime_dir="$(dirname "$(command -v "$zapc_bin")")"
+output=""
+args=()
+
+while (($#)); do
+    if [[ "$1" == "-o" ]]; then
+        [[ $# -ge 2 ]] || { echo "zapc-no-pie: -o requires a path" >&2; exit 2; }
+        output="$2"
+        args+=("-o" "${output}.o")
+        shift 2
+    else
+        args+=("$1")
+        shift
+    fi
+done
+
+[[ -n "$output" ]] || { echo "zapc-no-pie: an output path is required" >&2; exit 2; }
+
+"$zapc_bin" -c "${args[@]}"
+/usr/bin/cc -no-pie -o "$output" "${output}.o" "$runtime_dir/runtime.o" -lssl -lcrypto
+rm -f "${output}.o"
